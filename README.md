@@ -92,6 +92,32 @@ About 3.3k lines of tests to about 2.3k lines of code; 94% statement coverage ac
   wake-up, a scheduler-timing bug that a black-box test only catches occasionally. It's prevented structurally
   instead: every state change and its notification happen in one critical section.
 
+## Load testing
+
+`cmd/loadrun` runs the real service against a **generated file system** (`internal/loadtest`). The tree is computed
+from a seed, so millions of files cost no disk, setup or cleanup. Each video's behavior comes from a hash of its
+path: ok, corrupt, slow, hang or flaky. An in-process fake ffmpeg acts it out. `LatencyFS` adds per-call latency to
+mimic an object store. The report validates the end state against the tree's census (`"ok": true`).
+
+```sh
+make load FILES=1000000
+make load FILES=200000 ARGS="-list-latency 20ms -open-latency 5ms -walk-concurrency 64"
+```
+
+Baseline (M-series laptop, 64 workers, 1 ms simulated ffmpeg, 90% of files are videos):
+
+| Scenario | Scan | Files/s scanned | `OpenFile` calls | Peak heap |
+|---|---|---|---|---|
+| 1M files, no latency, cold | 30 s (paced by workers) | 33k | 1.93M | 226 MB |
+| 1M files, no latency, rescan (all up to date) | 2.0 s | 500k | 1.01M | 256 MB |
+| 200k files, 20 ms list / 5 ms stat, walk-concurrency 16 | 2 m 0 s | 1.7k | 386k | — |
+| 200k files, 20 ms list / 5 ms stat, walk-concurrency 64 | 1 m 5 s | 3.1k | 386k | — |
+
+With object-store latency **the scanner is the bottleneck**: workers starve (peak queue depth 36). Directories are
+listed one at a time, so a 20 ms list per directory sets a floor that no amount of walk concurrency removes. At 1M
+files that floor is ≥ 200 s; at 10M, over half an hour. A no-op rescan costs as much as a cold one. And every file is
+stat'ed twice: once by the walker, once by the worker's source check.
+
 ## Layout
 
 ```
@@ -104,6 +130,8 @@ internal/storage/    blob key scheme, in-memory stores
 internal/adapters/   OS file system, ffmpeg, scratch dir, local blob store, SQLite, checkpoint file
 internal/app/        config, service lifecycle (roles, scan loop), health endpoint
 internal/testkit/    fakes, fault injection, harness (test-only)
+internal/loadtest/   generated file system, latency wrapper, in-process fake ffmpeg, load-run report
+cmd/loadrun/         load-test entry point
 ```
 
 ## Known limits / next steps

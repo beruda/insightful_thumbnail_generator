@@ -1,4 +1,4 @@
-.PHONY: build test test-short race cover chaos lint demo
+.PHONY: build test test-short race cover chaos lint demo load
 
 build:
 	go build -o bin/thumbnailer ./cmd/thumbnailer
@@ -27,3 +27,10 @@ lint:
 # Run once over a directory: make demo ROOT=~/Movies
 demo: build
 	./bin/thumbnailer -root $(ROOT) -data-dir ./data -once
+
+# Synthetic load test: real service, generated file system, in-process fake ffmpeg. No disk use.
+#   make load FILES=1000000
+#   make load FILES=200000 ARGS="-list-latency 20ms -open-latency 5ms"
+FILES ?= 100000
+load:
+	go run ./cmd/loadrun -files $(FILES) $(ARGS)
