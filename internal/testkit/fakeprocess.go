@@ -47,6 +47,13 @@ func ExitWith(code int, stderr string) Script {
 	return Script{kind: "exit", delay: 10 * time.Millisecond, code: code, stderr: stderr}
 }
 
+// ExitAfter exits with code and stderr after d.
+func ExitAfter(code int, stderr string, d time.Duration) Script {
+	s := ExitWith(code, stderr)
+	s.delay = d
+	return s
+}
+
 // Hang never exits on its own; it ignores the first ignoreKills Kill calls (-1: unkillable).
 func Hang(ignoreKills int) Script { return Script{kind: "hang", ignoreKills: ignoreKills} }
 

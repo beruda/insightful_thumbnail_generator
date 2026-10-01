@@ -93,9 +93,7 @@ func (r *Runner) Handle(ctx context.Context, d queue.Delivery[domain.VideoJob]) 
 
 	switch state, failure := r.checkSource(ctx, job); state {
 	case sourceChanged, sourceGone:
-		r.deps.Metrics.Inc("worker.superseded." + string(state))
-		_ = d.Ack()
-		return Superseded
+		return r.superseded(d, state, "before_processing")
 	case sourceUnknown:
 		return r.fail(ctx, d, failure)
 	}
@@ -107,10 +105,30 @@ func (r *Runner) Handle(ctx context.Context, d queue.Delivery[domain.VideoJob]) 
 	if aborted {
 		return r.release(d)
 	}
+
+	// Check again before writing anything. If the file was replaced or deleted while ffmpeg ran,
+	// the result (thumbnail or failure) describes stale, possibly half-overwritten content, and
+	// writing it could clobber the record of a newer version committed meanwhile by another
+	// worker. The newer version has its own job, so this one just steps aside.
+	// This shrinks the race window from the whole ffmpeg run to the gap between this check and
+	// the write; closing it fully needs a conditional write or per-path ordering (see README).
+	// A failed stat (sourceUnknown) keeps the result: the source was verified before ffmpeg ran.
+	if state, _ := r.checkSource(ctx, job); state == sourceChanged || state == sourceGone {
+		return r.superseded(d, state, "during_processing")
+	}
+
 	if failure != nil {
 		return r.fail(ctx, d, *failure)
 	}
 	return r.commit(ctx, d, data, contentType)
+}
+
+func (r *Runner) superseded(d queue.Delivery[domain.VideoJob], state sourceState, when string) Outcome {
+	r.deps.Metrics.Inc("worker.superseded." + string(state))
+	r.deps.Metrics.Inc("worker.superseded." + when)
+	r.deps.Logger.Info("source changed, job superseded", "path", d.Message().Path, "source", state, "when", when)
+	_ = d.Ack()
+	return Superseded
 }
 
 type sourceState string

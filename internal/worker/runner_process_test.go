@@ -295,6 +295,85 @@ func TestRunnerStaleJobs(t *testing.T) {
 	})
 }
 
+// Regression for the review finding: a slow v1 job must not overwrite the record that a v2 job
+// committed while v1's ffmpeg was still running.
+func TestRunnerSourceChangesDuringProcessing(t *testing.T) {
+	// replaceDuringRun starts v1's 10s ffmpeg run; at 5s the file becomes v2 and (as if another
+	// worker finished first) a v2 ready record is committed.
+	replaceDuringRun := func(f *fixture) domain.ThumbnailRecord {
+		v2 := domain.ThumbnailRecord{VideoPath: video, SourceVersion: "6000-99", Status: domain.StatusReady, BlobKey: "v2-key", Notified: true}
+		time.AfterFunc(5*time.Second, func() {
+			f.FS.File(video, tk.Size(6000), tk.ModTimeMs(99))
+			_ = f.Repo.MemoryRepository.Upsert(context.Background(), v2)
+		})
+		return v2
+	}
+
+	t.Run("success on stale content: nothing written, newer record kept", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newFixture()
+			f.Launcher.Script(video, tk.SucceedAfter(10*time.Second))
+			v2 := replaceDuringRun(f)
+
+			outcome, s := f.deliver(1)
+
+			tk.Equal(t, outcome, worker.Superseded, "outcome")
+			tk.Equal(t, s.Type, "ack", "settlement")
+			rec, _ := f.record()
+			tk.Equal(t, rec, v2, "v2 record untouched")
+			tk.Equal(t, len(f.Blobs.Objects()), 0, "no stale blob uploaded")
+			tk.Equal(t, len(f.Events.Published()), 0, "no stale event")
+			tk.Equal(t, f.Metrics.Get("worker.superseded.during_processing"), 1, "metric")
+			f.noLeftovers(t)
+		})
+	})
+
+	t.Run("permanent failure on stale content: no failed record, newer record kept", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newFixture()
+			f.Launcher.Script(video, slowCorrupt(10*time.Second))
+			v2 := replaceDuringRun(f)
+
+			outcome, s := f.deliver(1)
+
+			tk.Equal(t, outcome, worker.Superseded, "outcome")
+			tk.Equal(t, s.Type, "ack", "settlement (not dead-lettered)")
+			rec, _ := f.record()
+			tk.Equal(t, rec, v2, "v2 record untouched")
+		})
+	})
+
+	t.Run("source deleted during processing: superseded", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newFixture()
+			f.Launcher.Script(video, tk.SucceedAfter(10*time.Second))
+			time.AfterFunc(5*time.Second, func() { f.FS.Remove(video) })
+
+			outcome, _ := f.deliver(1)
+
+			tk.Equal(t, outcome, worker.Superseded, "outcome")
+			tk.Equal(t, f.Metrics.Get("worker.superseded.gone"), 1, "metric")
+			tk.Equal(t, len(f.Blobs.Objects()), 0, "blobs")
+		})
+	})
+
+	t.Run("a failed re-check keeps the result (the source was verified before ffmpeg ran)", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newFixture()
+			f.Launcher.Script(video, tk.SucceedAfter(10*time.Second))
+			time.AfterFunc(5*time.Second, func() { f.FS.FailOpen(video, nil) })
+
+			outcome, _ := f.deliver(1)
+
+			tk.Equal(t, outcome, worker.Generated, "outcome")
+		})
+	})
+}
+
+func slowCorrupt(d time.Duration) tk.Script {
+	return tk.ExitAfter(1, tk.CorruptStderr, d)
+}
+
 func TestRunnerShutdown(t *testing.T) {
 	t.Run("shutdown already started: job released untouched", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {

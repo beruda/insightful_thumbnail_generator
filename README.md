@@ -71,7 +71,7 @@ flowchart LR
 | Stage | Where | Failure handling |
 |---|---|---|
 | **Walk** | `scanner/scanner.go` | One directory page per job, listed by M scanners in parallel. A pass ends when an outstanding-job counter reaches zero (+1 before each job is published, −1 when one is acked or dead-lettered). A listing error is retried with a delay; a directory that keeps failing is dead-lettered and the rest of the scan continues. A directory deleted mid-scan is skipped. Symlinks are skipped. |
-| **Read** | `scanner/scanner.go`, `worker/runner.go` | Freshness is checked per page against the repository (`NeedsWork`), so re-runs are cheap. Changes are detected by ETag, or size+mtime when there's no ETag. Fails open: if the repository is down, the page's videos are published anyway. The worker re-checks the source before running ffmpeg, in case the file changed or was deleted while queued. |
+| **Read** | `scanner/scanner.go`, `worker/runner.go` | Freshness is checked per page against the repository (`NeedsWork`), so re-runs are cheap. Changes are detected by ETag, or size+mtime when there's no ETag. Fails open: if the repository is down, the page's videos are published anyway. The worker re-checks the source before running ffmpeg (it may have changed or been deleted while queued) and again before writing anything (it may have changed while ffmpeg ran). Either way the job steps aside as superseded, so a slow job for an old version can't overwrite a newer version's record. |
 | **Process** | `worker/runprocess.go`, `failures.go` | Oversized inputs are rejected before ffmpeg starts. A timeout triggers kill, with SIGTERM escalating to SIGKILL. An unkillable process is abandoned and alerted on, so it can't hold the worker slot. stderr is classified: corrupt input, no video stream, unsupported codec or missing file are **permanent** and go straight to the dead-letter queue; anything else is **transient** and retried with exponential backoff and jitter through the queue. A zero exit code isn't trusted: missing, empty, oversized or non-image output (checked by magic bytes) counts as a failure. |
 | **Write** | `worker/runner.go`, `storage/` | Order is blob → record → event. The blob key `thumbnails/{shard}/{sha(path)}/{sha(version)}.jpg` is deterministic and immutable, so a retry overwrites the same object and CDN caches never need purging. Image bytes go to object storage; metadata goes to a database. |
 | **Done** | `worker/runner.go` | Ack only after commit. `ReadyEvent` is published, then `Notified` is set. A ready thumbnail is **never** downgraded to failed or dead-lettered. If the event bus stays down, the job is acked and the next scan re-sends the event. |
@@ -165,8 +165,14 @@ internal/loadtest/   generated file system, latency wrapper, in-process fake ffm
 - **Local paging is O(n) per page.** POSIX has no listing cursor that survives between calls, so each page re-reads
   the directory. Object stores page natively.
 - **Symlinks are skipped.** Following them across replicas needs shared loop detection.
-- **Conditional writes.** "Never downgrade ready" is a read-then-write guard. Fully closing the race between
-  concurrent duplicate deliveries needs `UPDATE … WHERE status <> 'ready'` in the database.
+- **Concurrent jobs for the same video.** Two guards are read-then-write, so each leaves a millisecond-wide race:
+  "never downgrade ready" (duplicate deliveries of one version), and the pre-commit source re-check (a slow job for
+  v1 finishing after a job for v2 committed; found by an external review). Both self-heal on the next scan, at the
+  cost of a stale window and a duplicate event. Two ways to close them fully:
+  - a conditional write in the database that only lets newer versions win, ordered by source mtime (ETags can't be
+    ordered), for example `ON CONFLICT … DO UPDATE … WHERE excluded.source_mtime >= thumbnails.source_mtime`;
+  - per-path ordering at the broker, so only one job per video runs at a time: an SQS FIFO queue with
+    `MessageGroupId = video_path`, or Pub/Sub ordering keys.
 - **Exactly-once events** need a transactional outbox. Today they are at-least-once, and duplicates are identical, so
   consumers can dedupe on `(videoPath, sourceVersion)`.
 - **Metrics** are in-process counters on `/healthz`; production would export them to Prometheus or OpenTelemetry.
