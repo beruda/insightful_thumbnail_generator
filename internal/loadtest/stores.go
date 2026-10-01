@@ -31,11 +31,16 @@ func NewCompactRepository() *CompactRepository {
 
 func (r *CompactRepository) Get(_ context.Context, videoPath string) (domain.ThumbnailRecord, bool, error) {
 	r.gets.Add(1)
+	rec, ok := r.lookup(videoPath)
+	return rec, ok, nil
+}
+
+func (r *CompactRepository) lookup(videoPath string) (domain.ThumbnailRecord, bool) {
 	r.mu.RLock()
 	c, ok := r.records[videoPath]
 	r.mu.RUnlock()
 	if !ok {
-		return domain.ThumbnailRecord{}, false, nil
+		return domain.ThumbnailRecord{}, false
 	}
 	rec := domain.ThumbnailRecord{VideoPath: videoPath, SourceVersion: c.version, Status: domain.StatusReady, Notified: c.notified}
 	if c.failed {
@@ -44,7 +49,19 @@ func (r *CompactRepository) Get(_ context.Context, videoPath string) (domain.Thu
 		rec.ContentType = "image/jpeg"
 		rec.BlobKey = storage.BlobKey(videoPath, c.version, rec.ContentType)
 	}
-	return rec, true, nil
+	return rec, true
+}
+
+// GetMany counts as one repository round trip, however many paths it covers.
+func (r *CompactRepository) GetMany(_ context.Context, videoPaths []string) (map[string]domain.ThumbnailRecord, error) {
+	r.gets.Add(1)
+	out := make(map[string]domain.ThumbnailRecord, len(videoPaths))
+	for _, p := range videoPaths {
+		if rec, ok := r.lookup(p); ok {
+			out[p] = rec
+		}
+	}
+	return out, nil
 }
 
 func (r *CompactRepository) Upsert(_ context.Context, rec domain.ThumbnailRecord) error {

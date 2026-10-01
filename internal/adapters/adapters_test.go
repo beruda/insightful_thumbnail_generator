@@ -3,6 +3,7 @@ package adapters_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,7 +14,9 @@ import (
 	"github.com/vukkremic/thumbnailer/internal/adapters"
 	"github.com/vukkremic/thumbnailer/internal/domain"
 	"github.com/vukkremic/thumbnailer/internal/metrics"
+	"github.com/vukkremic/thumbnailer/internal/queue"
 	"github.com/vukkremic/thumbnailer/internal/scanner"
+	"github.com/vukkremic/thumbnailer/internal/storage"
 	tk "github.com/vukkremic/thumbnailer/internal/testkit"
 )
 
@@ -27,38 +30,67 @@ func TestOSFileSystem(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	write(t, filepath.Join(root, "a.mp4"), "video")
-	write(t, filepath.Join(root, "sub", "b.mov"), "video")
+	write(t, filepath.Join(root, "b.mp4"), "video")
+	write(t, filepath.Join(root, "sub", "c.mov"), "video")
 	tk.Equal(t, os.Symlink(root, filepath.Join(root, "sub", "loop")), nil, "symlink")
 	tk.Equal(t, os.Symlink(filepath.Join(root, "missing"), filepath.Join(root, "dangling")), nil, "symlink")
-	fsys := adapters.OSFileSystem{}
 
-	t.Run("lists direct children as full paths", func(t *testing.T) {
-		children, err := fsys.ListFiles(ctx, root)
+	listAll := func(fsys adapters.OSFileSystem, dir string) (names []string, pages int) {
+		token := ""
+		for {
+			page, err := fsys.ListPage(ctx, dir, token)
+			tk.Equal(t, err, nil, "ListPage")
+			pages++
+			for _, e := range page.Entries {
+				names = append(names, e.Name)
+			}
+			if token = page.NextToken; token == "" {
+				return names, pages
+			}
+		}
+	}
+
+	t.Run("lists children with metadata, symlinks flagged and not followed", func(t *testing.T) {
+		page, err := adapters.OSFileSystem{}.ListPage(ctx, root, "")
 		tk.Equal(t, err, nil, "error")
-		slices.Sort(children)
-		tk.Equal(t, children, []string{filepath.Join(root, "a.mp4"), filepath.Join(root, "dangling"), filepath.Join(root, "sub")}, "children")
+		byName := map[string]domain.FileInfo{}
+		for _, e := range page.Entries {
+			byName[e.Name] = e
+		}
+		tk.Equal(t, len(byName), 4, "entries")
+		a := byName["a.mp4"]
+		tk.Equal(t, [5]any{a.Path, a.Size, a.IsDir, a.IsSymlink, a.Permissions},
+			[5]any{filepath.Join(root, "a.mp4"), int64(5), false, false, uint32(0o644)}, "a.mp4")
+		tk.True(t, time.Since(a.ModTime) < time.Minute, "mtime %v", a.ModTime)
+		tk.True(t, byName["sub"].IsDir, "sub is a directory")
+		tk.True(t, byName["dangling"].IsSymlink, "dangling is flagged as a symlink")
+		tk.Equal(t, page.NextToken, "", "single page")
 	})
 
-	t.Run("reports file metadata", func(t *testing.T) {
-		info, err := fsys.OpenFile(ctx, filepath.Join(root, "a.mp4"))
-		tk.Equal(t, err, nil, "error")
-		tk.Equal(t, [4]any{info.Name, info.Size, info.IsDir, info.Permissions}, [4]any{"a.mp4", int64(5), false, uint32(0o644)}, "info")
-		tk.True(t, time.Since(info.ModTime) < time.Minute, "mtime %v", info.ModTime)
+	t.Run("paginates in name order", func(t *testing.T) {
+		names, pages := listAll(adapters.OSFileSystem{PageSize: 2}, root)
+		tk.Equal(t, names, []string{"a.mp4", "b.mp4", "dangling", "sub"}, "names")
+		tk.Equal(t, pages, 2, "pages")
 	})
 
-	t.Run("a dangling symlink is reported as not found", func(t *testing.T) {
-		_, err := fsys.OpenFile(ctx, filepath.Join(root, "dangling"))
+	t.Run("a missing directory is reported as not found", func(t *testing.T) {
+		_, err := adapters.OSFileSystem{}.ListPage(ctx, filepath.Join(root, "nope"), "")
 		tk.True(t, errors.Is(err, fs.ErrNotExist), "err = %v", err)
 	})
 
-	t.Run("the walker terminates on a real symlink loop", func(t *testing.T) {
-		w := scanner.NewWalker(fsys, root, scanner.WalkerOptions{Concurrency: 4, FollowSymlinks: true, Logger: quiet(), Metrics: metrics.New()})
+	t.Run("the scanner skips a real symlink loop", func(t *testing.T) {
+		videos := queue.NewMemory[domain.VideoJob](100)
+		s := scanner.New(scanner.Deps{
+			FS: adapters.OSFileSystem{}, Dirs: queue.NewUnbounded[scanner.DirJob](), Videos: videos,
+			Repository: storage.NewMemoryRepository(), Logger: quiet(), Metrics: metrics.New(),
+		}, scanner.Config{Root: root, Extensions: scanner.DefaultVideoExtensions, Concurrency: 4})
+		tk.Equal(t, s.ScanOnce(ctx), nil, "ScanOnce")
 		var names []string
-		for f := range w.Files(ctx) {
-			names = append(names, f.Name)
+		for _, j := range videos.Pending() {
+			names = append(names, filepath.Base(j.Path))
 		}
 		slices.Sort(names)
-		tk.Equal(t, names, []string{"a.mp4", "b.mov"}, "files")
+		tk.Equal(t, names, []string{"a.mp4", "b.mp4", "c.mov"}, "published")
 	})
 }
 
@@ -97,32 +129,21 @@ func TestSQLiteRepository(t *testing.T) {
 	got, _, _ := repo.Get(ctx, "/a.mp4")
 	tk.Equal(t, got, rec, "round trip")
 
+	other := rec
+	other.VideoPath = "/b.mp4"
+	tk.Equal(t, repo.Upsert(ctx, other), nil, "insert second")
+	paths := []string{"/a.mp4", "/b.mp4", "/missing.mp4"}
+	for i := range 1200 {
+		paths = append(paths, fmt.Sprintf("/x%d.mp4", i)) // spans several IN (...) chunks
+	}
+	many, err := repo.GetMany(ctx, paths)
+	tk.Equal(t, err, nil, "GetMany")
+	tk.Equal(t, many, map[string]domain.ThumbnailRecord{"/a.mp4": rec, "/b.mp4": other}, "GetMany results")
+
 	rec.Status, rec.FailureKind, rec.FailureReason, rec.Notified = domain.StatusFailed, "corrupt_input", "moov atom not found", false
 	tk.Equal(t, repo.Upsert(ctx, rec), nil, "update")
 	got, _, _ = repo.Get(ctx, "/a.mp4")
 	tk.Equal(t, got, rec, "updated round trip")
-}
-
-func TestFileCheckpoints(t *testing.T) {
-	ctx := context.Background()
-	store := adapters.FileCheckpoints{Path: filepath.Join(t.TempDir(), "nested", "cp.json")}
-
-	cp, err := store.Load(ctx)
-	tk.True(t, cp == nil && err == nil, "empty store: %v, %v", cp, err)
-
-	want := scanner.Checkpoint{Root: "/r", Position: scanner.Position{Pending: []string{"/r/a"}, Current: &scanner.Cursor{Dir: "/r", After: "/r/x"}}}
-	tk.Equal(t, store.Save(ctx, want), nil, "save")
-	got, _ := store.Load(ctx)
-	tk.Equal(t, *got, want, "round trip")
-
-	tk.Equal(t, store.Clear(ctx), nil, "clear")
-	tk.Equal(t, store.Clear(ctx), nil, "clear twice")
-	cp, _ = store.Load(ctx)
-	tk.True(t, cp == nil, "cleared")
-
-	write(t, store.Path, "{not json")
-	_, err = store.Load(ctx)
-	tk.True(t, err != nil, "corrupt checkpoint should error")
 }
 
 func TestScratchDir(t *testing.T) {

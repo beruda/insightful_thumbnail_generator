@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
@@ -48,6 +49,10 @@ func NewMemory[T any](capacity int) *Memory[T] {
 	}
 	return &Memory[T]{capacity: capacity, delayed: map[*envelope[T]]struct{}{}, changed: make(chan struct{})}
 }
+
+// NewUnbounded returns a queue whose Publish never blocks, for queues that their own consumers
+// publish to (see scanner.Deps.Dirs).
+func NewUnbounded[T any]() *Memory[T] { return NewMemory[T](math.MaxInt) }
 
 func (q *Memory[T]) Publish(ctx context.Context, msg T) error {
 	q.mu.Lock()

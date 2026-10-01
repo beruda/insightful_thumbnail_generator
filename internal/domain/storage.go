@@ -40,6 +40,9 @@ type ThumbnailRecord struct {
 type Repository interface {
 	// Get returns the record for videoPath, and false if there is none.
 	Get(ctx context.Context, videoPath string) (ThumbnailRecord, bool, error)
+	// GetMany returns the records that exist among videoPaths, keyed by path. The scanner checks
+	// a whole listing page in one round trip instead of one query per file.
+	GetMany(ctx context.Context, videoPaths []string) (map[string]ThumbnailRecord, error)
 	Upsert(ctx context.Context, record ThumbnailRecord) error
 }
 

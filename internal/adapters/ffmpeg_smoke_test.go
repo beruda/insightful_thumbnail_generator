@@ -16,6 +16,7 @@ import (
 	"github.com/vukkremic/thumbnailer/internal/domain"
 	"github.com/vukkremic/thumbnailer/internal/metrics"
 	"github.com/vukkremic/thumbnailer/internal/queue"
+	"github.com/vukkremic/thumbnailer/internal/scanner"
 	tk "github.com/vukkremic/thumbnailer/internal/testkit"
 	"github.com/vukkremic/thumbnailer/internal/worker"
 )
@@ -124,9 +125,9 @@ func TestEndToEnd(t *testing.T) {
 		q := queue.NewMemory[domain.VideoJob](opts.QueueCapacity)
 		m := metrics.New()
 		svc := app.NewService(app.Deps{
-			FS: adapters.OSFileSystem{}, Queue: q, Launch: adapters.FFmpegLauncher(bin, 320),
+			FS: adapters.OSFileSystem{}, Videos: q, Dirs: queue.NewUnbounded[scanner.DirJob](), Launch: adapters.FFmpegLauncher(bin, 320),
 			Scratch: adapters.ScratchDir{Dir: opts.Paths().Scratch}, Blobs: adapters.LocalBlobStore{Root: opts.Paths().Blobs},
-			Repository: repo, Events: app.LogEvents{Logger: quiet()}, Checkpoints: adapters.FileCheckpoints{Path: opts.Paths().Checkpoint},
+			Repository: repo, Events: app.LogEvents{Logger: quiet()},
 			Random: tk.Seeded(1), Logger: quiet(), Metrics: m,
 		}, opts.Service)
 		tk.Equal(t, svc.Run(context.Background()), nil, "run")

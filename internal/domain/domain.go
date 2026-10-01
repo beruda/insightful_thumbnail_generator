@@ -8,16 +8,25 @@ import (
 	"time"
 )
 
-// FileSystem is the brief's IFileSystem, adapted:
+// FileSystem is the brief's IFileSystem, adapted for scale:
 //   - methods take a context and return errors, since a remote file system can be slow or fail;
-//   - ListFiles returns the direct children of a directory (full paths), so callers control traversal;
-//   - FileInfo gains ModTime/ETag (to detect changed sources) and symlink data (to avoid loops).
+//   - listing is paginated and returns each child's metadata, the way object stores do (S3's
+//     ListObjectsV2 returns size, ETag and mtime for up to 1000 keys per call), so a scan needs
+//     no per-file stat and one huge directory splits into many independent pages;
+//   - FileInfo gains ModTime/ETag, to detect changed sources.
 //
 // Errors for missing paths must satisfy errors.Is(err, fs.ErrNotExist), as os errors do.
 type FileSystem interface {
-	ListFiles(ctx context.Context, path string) ([]string, error)
-	// OpenFile returns metadata for path. Symlinks are resolved: IsDir/Size describe the target.
+	// ListPage returns one page of dir's direct children. pageToken is "" for the first page;
+	// the returned NextToken is "" on the last page.
+	ListPage(ctx context.Context, dir, pageToken string) (Page, error)
+	// OpenFile returns metadata for one path (the worker uses it to re-check a source).
 	OpenFile(ctx context.Context, path string) (FileInfo, error)
+}
+
+type Page struct {
+	Entries   []FileInfo
+	NextToken string
 }
 
 type FileInfo struct {
@@ -26,10 +35,10 @@ type FileInfo struct {
 	Permissions uint32 // POSIX mode bits, e.g. 0o644
 	Size        int64
 	IsDir       bool
-	IsSymlink   bool
-	// CanonicalPath is the path with symlinks resolved; equal to Path for regular entries.
-	CanonicalPath string
-	ModTime       time.Time
+	// IsSymlink marks a symbolic link. Scanners skip these: following them safely needs loop
+	// detection shared across scanner replicas, and object stores don't have them anyway.
+	IsSymlink bool
+	ModTime   time.Time
 	// ETag is the content version reported by object stores; preferred over ModTime when set.
 	ETag string
 }

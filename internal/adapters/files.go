@@ -4,15 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/vukkremic/thumbnailer/internal/scanner"
 )
 
 // ScratchDir is domain.ScratchSpace on a local directory (ffmpeg needs a real path to write to).
@@ -52,39 +49,6 @@ func (s LocalBlobStore) PathFor(key string) (string, error) {
 		return "", fmt.Errorf("invalid blob key %q", key)
 	}
 	return filepath.Join(s.Root, key), nil
-}
-
-// FileCheckpoints is a scanner.CheckpointStore backed by one JSON file, written atomically.
-type FileCheckpoints struct{ Path string }
-
-func (c FileCheckpoints) Load(context.Context) (*scanner.Checkpoint, error) {
-	data, err := os.ReadFile(c.Path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var cp scanner.Checkpoint
-	if err := json.Unmarshal(data, &cp); err != nil {
-		return nil, fmt.Errorf("corrupt checkpoint %s: %w", c.Path, err)
-	}
-	return &cp, nil
-}
-
-func (c FileCheckpoints) Save(_ context.Context, cp scanner.Checkpoint) error {
-	data, err := json.Marshal(cp)
-	if err != nil {
-		return err
-	}
-	return writeAtomic(c.Path, data)
-}
-
-func (c FileCheckpoints) Clear(context.Context) error {
-	if err := os.Remove(c.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	return nil
 }
 
 func writeAtomic(dest string, data []byte) error {

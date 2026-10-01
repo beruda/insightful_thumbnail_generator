@@ -24,17 +24,18 @@ const (
 
 // Deps is every side effect the service has, as one bundle. Tests pass fakes; main passes real adapters.
 type Deps struct {
-	FS          domain.FileSystem
-	Queue       queue.Queue[domain.VideoJob]
-	Launch      domain.Launcher
-	Scratch     domain.ScratchSpace
-	Blobs       domain.BlobStore
-	Repository  domain.Repository
-	Events      domain.EventPublisher
-	Checkpoints scanner.CheckpointStore
-	Random      func() float64
-	Logger      *slog.Logger
-	Metrics     *metrics.Counters
+	FS     domain.FileSystem
+	Videos queue.Queue[domain.VideoJob]
+	// Dirs is the scanner's work queue of directory pages. It must be unbounded (see scanner.Deps).
+	Dirs       queue.Queue[scanner.DirJob]
+	Launch     domain.Launcher
+	Scratch    domain.ScratchSpace
+	Blobs      domain.BlobStore
+	Repository domain.Repository
+	Events     domain.EventPublisher
+	Random     func() float64
+	Logger     *slog.Logger
+	Metrics    *metrics.Counters
 }
 
 type Config struct {
@@ -60,7 +61,7 @@ func NewService(deps Deps, cfg Config) *Service {
 	s := &Service{deps: deps, cfg: cfg}
 	if cfg.Role == RoleAll || cfg.Role == RoleScanner {
 		s.scanner = scanner.New(scanner.Deps{
-			FS: deps.FS, Queue: deps.Queue, Repository: deps.Repository, Checkpoints: deps.Checkpoints,
+			FS: deps.FS, Dirs: deps.Dirs, Videos: deps.Videos, Repository: deps.Repository,
 			Logger: deps.Logger, Metrics: deps.Metrics,
 		}, cfg.Scanner)
 	}
@@ -70,7 +71,7 @@ func NewService(deps Deps, cfg Config) *Service {
 			Repository: deps.Repository, Events: deps.Events, Random: deps.Random,
 			Logger: deps.Logger, Metrics: deps.Metrics,
 		}, cfg.Runner)
-		s.worker = worker.New(deps.Queue, runner, deps.Logger, cfg.Worker)
+		s.worker = worker.New(deps.Videos, runner, deps.Logger, cfg.Worker)
 	}
 	return s
 }
@@ -105,7 +106,7 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) runScanLoop(ctx context.Context) error {
 	if s.cfg.Once {
 		// In one-shot mode, closing the queue lets workers finish once the backlog is drained.
-		defer s.deps.Queue.Close()
+		defer s.deps.Videos.Close()
 	}
 	for {
 		if err := s.scanner.ScanOnce(ctx); err != nil {

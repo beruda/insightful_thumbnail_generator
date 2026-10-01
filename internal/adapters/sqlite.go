@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver, no cgo
@@ -45,27 +47,61 @@ func OpenSQLite(path string) (*SQLiteRepository, error) {
 
 func (r *SQLiteRepository) Close() error { return r.db.Close() }
 
+const columns = `video_path, source_version, status, blob_key, byte_length, content_type,
+	failure_kind, failure_reason, attempts, notified, updated_at`
+
+// getManyChunk keeps IN (...) lists well under SQLite's bound-parameter limit.
+const getManyChunk = 500
+
 func (r *SQLiteRepository) Get(ctx context.Context, videoPath string) (domain.ThumbnailRecord, bool, error) {
-	var rec domain.ThumbnailRecord
-	var status string
-	var notified int
-	var updated int64
-	err := r.db.QueryRowContext(ctx, `
-		SELECT video_path, source_version, status, blob_key, byte_length, content_type,
-		       failure_kind, failure_reason, attempts, notified, updated_at
-		FROM thumbnails WHERE video_path = ?`, videoPath).
-		Scan(&rec.VideoPath, &rec.SourceVersion, &status, &rec.BlobKey, &rec.ByteLength, &rec.ContentType,
-			&rec.FailureKind, &rec.FailureReason, &rec.Attempts, &notified, &updated)
+	rec, err := scanRecord(r.db.QueryRowContext(ctx, "SELECT "+columns+" FROM thumbnails WHERE video_path = ?", videoPath))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.ThumbnailRecord{}, false, nil
 	}
 	if err != nil {
 		return domain.ThumbnailRecord{}, false, err
 	}
+	return rec, true, nil
+}
+
+func (r *SQLiteRepository) GetMany(ctx context.Context, videoPaths []string) (map[string]domain.ThumbnailRecord, error) {
+	out := make(map[string]domain.ThumbnailRecord, len(videoPaths))
+	for chunk := range slices.Chunk(videoPaths, getManyChunk) {
+		args := make([]any, len(chunk))
+		for i, p := range chunk {
+			args[i] = p
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		rows, err := r.db.QueryContext(ctx, "SELECT "+columns+" FROM thumbnails WHERE video_path IN ("+placeholders+")", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			rec, err := scanRecord(rows)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[rec.VideoPath] = rec
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func scanRecord(row interface{ Scan(...any) error }) (domain.ThumbnailRecord, error) {
+	var rec domain.ThumbnailRecord
+	var status string
+	var notified int
+	var updated int64
+	err := row.Scan(&rec.VideoPath, &rec.SourceVersion, &status, &rec.BlobKey, &rec.ByteLength, &rec.ContentType,
+		&rec.FailureKind, &rec.FailureReason, &rec.Attempts, &notified, &updated)
 	rec.Status = domain.Status(status)
 	rec.Notified = notified == 1
 	rec.UpdatedAt = time.UnixMilli(updated)
-	return rec, true, nil
+	return rec, err
 }
 
 func (r *SQLiteRepository) Upsert(ctx context.Context, rec domain.ThumbnailRecord) error {

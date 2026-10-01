@@ -25,6 +25,8 @@ type TreeConfig struct {
 	Files       int
 	FanOut      int
 	FilesPerDir int
+	// PageSize is how many entries one ListPage call returns (S3 returns up to 1000).
+	PageSize int
 	// VideoRatio is the fraction of files with a video extension; the rest are .txt.
 	VideoRatio float64
 	Mix        Mix
@@ -54,9 +56,10 @@ var modTime = time.UnixMilli(1_700_000_000_000)
 // GeneratedFS is a domain.FileSystem whose contents are computed from the path and a seed, so a
 // tree of any size costs no memory or disk. It is deterministic: same config, same tree.
 type GeneratedFS struct {
-	root    string
-	cfg     TreeConfig
-	numDirs int
+	root     string
+	cfg      TreeConfig
+	numDirs  int
+	pageSize int
 }
 
 func NewGeneratedFS(root string, cfg TreeConfig) *GeneratedFS {
@@ -67,44 +70,66 @@ func NewGeneratedFS(root string, cfg TreeConfig) *GeneratedFS {
 		cfg.FilesPerDir = 1
 	}
 	numDirs := max(1, (cfg.Files+cfg.FilesPerDir-1)/cfg.FilesPerDir)
-	return &GeneratedFS{root: strings.TrimSuffix(root, "/"), cfg: cfg, numDirs: numDirs}
+	return &GeneratedFS{root: strings.TrimSuffix(root, "/"), cfg: cfg, numDirs: numDirs, pageSize: max(1, cfg.PageSize)}
 }
 
 func (g *GeneratedFS) Root() string { return g.root }
 func (g *GeneratedFS) Dirs() int    { return g.numDirs }
 
-func (g *GeneratedFS) ListFiles(_ context.Context, p string) ([]string, error) {
+// ListPage lists dir's children (subdirectories first, then files) PageSize at a time. The token
+// is the offset of the next entry, like an object store's continuation token.
+func (g *GeneratedFS) ListPage(_ context.Context, p, token string) (domain.Page, error) {
 	dir, ok := g.parseDir(p)
 	if !ok {
-		return nil, notExist(p)
+		return domain.Page{}, notExist(p)
 	}
-	var out []string
-	for c := g.cfg.FanOut*dir + 1; c <= g.cfg.FanOut*dir+g.cfg.FanOut && c < g.numDirs; c++ {
-		out = append(out, p+"/d"+strconv.Itoa(c))
+	offset := 0
+	if token != "" {
+		var err error
+		if offset, err = strconv.Atoi(token); err != nil || offset < 0 {
+			return domain.Page{}, fmt.Errorf("invalid page token %q", token)
+		}
 	}
-	for j := range g.filesIn(dir) {
-		out = append(out, p+"/"+g.fileName(dir, j))
+	firstChild := g.cfg.FanOut*dir + 1
+	subdirs := max(0, min(g.cfg.FanOut, g.numDirs-firstChild))
+	total := subdirs + g.filesIn(dir)
+	end := min(offset+g.pageSize, total)
+
+	var page domain.Page
+	for i := offset; i < end; i++ {
+		if i < subdirs {
+			child := p + "/d" + strconv.Itoa(firstChild+i)
+			page.Entries = append(page.Entries, domain.FileInfo{Path: child, Name: path.Base(child), Permissions: 0o755, IsDir: true, ModTime: modTime})
+		} else {
+			page.Entries = append(page.Entries, g.fileInfo(p, dir, i-subdirs))
+		}
 	}
-	return out, nil
+	if end < total {
+		page.NextToken = strconv.Itoa(end)
+	}
+	return page, nil
 }
 
 func (g *GeneratedFS) OpenFile(_ context.Context, p string) (domain.FileInfo, error) {
 	if _, ok := g.parseDir(p); ok {
-		return domain.FileInfo{Path: p, Name: path.Base(p), Permissions: 0o755, IsDir: true, CanonicalPath: p, ModTime: modTime}, nil
+		return domain.FileInfo{Path: p, Name: path.Base(p), Permissions: 0o755, IsDir: true, ModTime: modTime}, nil
 	}
 	dir, j, ok := g.parseFile(p)
 	if !ok {
 		return domain.FileInfo{}, notExist(p)
 	}
-	h := g.hash(dir, j)
+	return g.fileInfo(path.Dir(p), dir, j), nil
+}
+
+func (g *GeneratedFS) fileInfo(dirPath string, dir, j int) domain.FileInfo {
+	name := g.fileName(dir, j)
 	return domain.FileInfo{
-		Path:          p,
-		Name:          path.Base(p),
-		Permissions:   0o644,
-		Size:          1<<20 + int64(h%(500<<20)), // 1 MB … 501 MB
-		CanonicalPath: p,
-		ModTime:       modTime,
-	}, nil
+		Path:        dirPath + "/" + name,
+		Name:        name,
+		Permissions: 0o644,
+		Size:        1<<20 + int64(g.hash(dir, j)%(500<<20)), // 1 MB … 501 MB
+		ModTime:     modTime,
+	}
 }
 
 // Behavior returns how the fake ffmpeg should treat the video at p.
@@ -229,12 +254,12 @@ type LatencyFS struct {
 	opens       atomic.Int64
 }
 
-func (l *LatencyFS) ListFiles(ctx context.Context, p string) ([]string, error) {
+func (l *LatencyFS) ListPage(ctx context.Context, p, token string) (domain.Page, error) {
 	l.lists.Add(1)
 	if err := sleep(ctx, l.ListLatency); err != nil {
-		return nil, err
+		return domain.Page{}, err
 	}
-	return l.Inner.ListFiles(ctx, p)
+	return l.Inner.ListPage(ctx, p, token)
 }
 
 func (l *LatencyFS) OpenFile(ctx context.Context, p string) (domain.FileInfo, error) {

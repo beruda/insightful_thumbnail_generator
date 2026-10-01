@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	"github.com/vukkremic/thumbnailer/internal/domain"
-	"github.com/vukkremic/thumbnailer/internal/scanner"
 	"github.com/vukkremic/thumbnailer/internal/storage"
 )
 
@@ -133,6 +132,13 @@ func (r *Repo) Get(ctx context.Context, videoPath string) (domain.ThumbnailRecor
 	return r.MemoryRepository.Get(ctx, videoPath)
 }
 
+func (r *Repo) GetMany(ctx context.Context, videoPaths []string) (map[string]domain.ThumbnailRecord, error) {
+	if err := r.check("GetMany"); err != nil {
+		return nil, err
+	}
+	return r.MemoryRepository.GetMany(ctx, videoPaths)
+}
+
 func (r *Repo) Upsert(ctx context.Context, rec domain.ThumbnailRecord) error {
 	if err := r.check("Upsert"); err != nil {
 		return err
@@ -155,30 +161,4 @@ func (e *Events) Publish(ctx context.Context, ev domain.ReadyEvent) error {
 		return err
 	}
 	return e.MemoryEvents.Publish(ctx, ev)
-}
-
-type Checkpoints struct {
-	scanner.MemoryCheckpoints
-	Faults
-}
-
-func (c *Checkpoints) Load(ctx context.Context) (*scanner.Checkpoint, error) {
-	if err := c.check("Load"); err != nil {
-		return nil, err
-	}
-	return c.MemoryCheckpoints.Load(ctx)
-}
-
-func (c *Checkpoints) Save(ctx context.Context, cp scanner.Checkpoint) error {
-	if err := c.check("Save"); err != nil {
-		return err
-	}
-	return c.MemoryCheckpoints.Save(ctx, cp)
-}
-
-func (c *Checkpoints) Clear(ctx context.Context) error {
-	if err := c.check("Clear"); err != nil {
-		return err
-	}
-	return c.MemoryCheckpoints.Clear(ctx)
 }

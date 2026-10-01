@@ -22,12 +22,12 @@ import (
 
 type Config struct {
 	Tree TreeConfig
-	// ListLatency / OpenLatency are added to every ListFiles / OpenFile call.
+	// ListLatency / OpenLatency are added to every ListPage / OpenFile call.
 	ListLatency, OpenLatency time.Duration
 	// Work is the simulated ffmpeg time for a normal video.
 	Work            time.Duration
 	Concurrency     int // worker pool size
-	WalkConcurrency int // parallel OpenFile calls in the walker
+	ScanConcurrency int // directory pages listed in parallel
 	QueueCapacity   int
 	ProcessTimeout  time.Duration
 	// Passes is how many full runs to do over the same tree. Pass 2+ should find everything
@@ -39,12 +39,12 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Tree: TreeConfig{
-			Seed: 1, Files: 100_000, FanOut: 8, FilesPerDir: 100, VideoRatio: 0.9,
+			Seed: 1, Files: 100_000, FanOut: 8, FilesPerDir: 100, PageSize: 1000, VideoRatio: 0.9,
 			Mix: Mix{Corrupt: 0.01, Slow: 0.005, Hang: 0.0005, Flaky: 0.01},
 		},
 		Work:            time.Millisecond,
 		Concurrency:     64,
-		WalkConcurrency: 16,
+		ScanConcurrency: 16,
 		QueueCapacity:   1000,
 		ProcessTimeout:  2 * time.Second,
 		Passes:          2,
@@ -63,7 +63,7 @@ type Report struct {
 		OpenLatency     string `json:"openLatency"`
 		Work            string `json:"work"`
 		Concurrency     int    `json:"concurrency"`
-		WalkConcurrency int    `json:"walkConcurrency"`
+		ScanConcurrency int    `json:"scanConcurrency"`
 		QueueCapacity   int    `json:"queueCapacity"`
 	} `json:"config"`
 	Passes []PassReport `json:"passes"`
@@ -109,7 +109,7 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	rep.Tree.Files, rep.Tree.Videos, rep.Tree.ByKind = gen.Census()
 	rep.Tree.Dirs = gen.Dirs()
 	rep.Config.ListLatency, rep.Config.OpenLatency, rep.Config.Work = cfg.ListLatency.String(), cfg.OpenLatency.String(), cfg.Work.String()
-	rep.Config.Concurrency, rep.Config.WalkConcurrency, rep.Config.QueueCapacity = cfg.Concurrency, cfg.WalkConcurrency, cfg.QueueCapacity
+	rep.Config.Concurrency, rep.Config.ScanConcurrency, rep.Config.QueueCapacity = cfg.Concurrency, cfg.ScanConcurrency, cfg.QueueCapacity
 
 	allDead := map[string]int{}
 	for pass := 1; pass <= max(1, cfg.Passes); pass++ {
@@ -151,15 +151,15 @@ func runPass(ctx context.Context, cfg Config, pass int, gen *GeneratedFS, fsys *
 
 	// Hung videos: timeout on attempt 1, then twice more with backoff, then dead-lettered.
 	svc := app.NewService(app.Deps{
-		FS: fsys, Queue: q, Launch: launcher.Launch, Scratch: scratch, Blobs: &DiscardBlobs{},
-		Repository: repo, Events: &CountingEvents{}, Checkpoints: &scanner.MemoryCheckpoints{},
+		FS: fsys, Videos: q, Dirs: queue.NewUnbounded[scanner.DirJob](), Launch: launcher.Launch, Scratch: scratch, Blobs: &DiscardBlobs{},
+		Repository: repo, Events: &CountingEvents{},
 		Random: rand.Float64, Logger: logger, Metrics: counters,
 	}, app.Config{
 		Role: app.RoleAll,
 		Once: true,
 		Scanner: scanner.Config{
 			Root: gen.Root(), Extensions: scanner.DefaultVideoExtensions,
-			WalkConcurrency: cfg.WalkConcurrency, CheckpointEvery: 1000,
+			Concurrency: cfg.ScanConcurrency, MaxAttempts: 5, RetryDelay: 10 * time.Millisecond,
 		},
 		Worker: worker.Config{Concurrency: cfg.Concurrency},
 		Runner: worker.RunnerConfig{

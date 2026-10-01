@@ -88,6 +88,18 @@ func (r *MemoryRepository) Get(_ context.Context, videoPath string) (domain.Thum
 	return rec, ok, nil
 }
 
+func (r *MemoryRepository) GetMany(_ context.Context, videoPaths []string) (map[string]domain.ThumbnailRecord, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]domain.ThumbnailRecord, len(videoPaths))
+	for _, p := range videoPaths {
+		if rec, ok := r.records[p]; ok {
+			out[p] = rec
+		}
+	}
+	return out, nil
+}
+
 func (r *MemoryRepository) Upsert(_ context.Context, rec domain.ThumbnailRecord) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

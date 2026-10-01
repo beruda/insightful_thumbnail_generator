@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"io/fs"
 	"path"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,7 +36,6 @@ type node struct {
 	modTime  time.Time
 	perm     uint32
 	etag     string
-	target   string
 	children map[string]*node
 }
 
@@ -51,20 +52,27 @@ var ErrIO = errors.New("input/output error")
 // NotExist returns an error satisfying errors.Is(err, fs.ErrNotExist), like os errors do.
 func NotExist(p string) error { return &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist} }
 
-// FS is an in-memory domain.FileSystem. Faults (per-path errors, latency, files that vanish
-// between list and open) can be injected, and calls and peak concurrency are recorded.
+// FS is an in-memory domain.FileSystem with paginated listing. Faults (per-path errors, transient
+// list failures, latency) can be injected, and calls and peak concurrency are recorded.
 type FS struct {
-	mu       sync.Mutex
-	root     *node
-	listErrs map[string]error
-	openErrs map[string]error
-	latency  time.Duration
+	mu        sync.Mutex
+	root      *node
+	pageSize  int
+	listErrs  map[string]listFault
+	openErrs  map[string]error
+	latency   time.Duration
+	listCalls map[string]int // per directory
 
-	listCalls, openCalls, inFlight, peakInFlight int
+	openCalls, inFlight, peakInFlight int
+}
+
+type listFault struct {
+	err   error
+	times int // remaining failures; < 0 means forever
 }
 
 func NewFS() *FS {
-	return &FS{root: newDir(), listErrs: map[string]error{}, openErrs: map[string]error{}}
+	return &FS{root: newDir(), pageSize: 1000, listErrs: map[string]listFault{}, openErrs: map[string]error{}, listCalls: map[string]int{}}
 }
 
 func newDir() *node { return &node{kind: kindDir, perm: 0o755, children: map[string]*node{}} }
@@ -78,8 +86,18 @@ func (f *FS) File(p string, opts ...FileOpt) *FS {
 	return f.put(p, n)
 }
 
-func (f *FS) Dir(p string) *FS             { return f.put(p, newDir()) }
-func (f *FS) Symlink(p, target string) *FS { return f.put(p, &node{kind: kindSymlink, target: target}) }
+func (f *FS) Dir(p string) *FS { return f.put(p, newDir()) }
+
+// Symlink adds a symbolic link entry. Its target doesn't matter: scanners skip symlinks.
+func (f *FS) Symlink(p string) *FS { return f.put(p, &node{kind: kindSymlink, perm: 0o777}) }
+
+// WithPageSize sets how many entries one ListPage call returns.
+func (f *FS) WithPageSize(n int) *FS {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pageSize = n
+	return f
+}
 
 func (f *FS) put(p string, n *node) *FS {
 	f.mu.Lock()
@@ -104,16 +122,19 @@ func (f *FS) put(p string, n *node) *FS {
 func (f *FS) Remove(p string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if parent := f.lookup(split(path.Dir(p))); parent != nil && parent.kind == kindDir {
+	if parent := f.lookup(p, true); parent != nil && parent.kind == kindDir {
 		delete(parent.children, path.Base(p))
 	}
 }
 
-// FailList makes ListFiles(p) fail with err (ErrIO if nil).
-func (f *FS) FailList(p string, err error) *FS {
+// FailList makes every ListPage(dir) fail with err (ErrIO if nil).
+func (f *FS) FailList(dir string, err error) *FS { return f.FailListTimes(dir, -1, err) }
+
+// FailListTimes makes the next n ListPage(dir) calls fail with err (ErrIO if nil).
+func (f *FS) FailListTimes(dir string, n int, err error) *FS {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.listErrs[p] = cmpOr(err, ErrIO)
+	f.listErrs[dir] = listFault{err: cmpOr(err, ErrIO), times: n}
 	return f
 }
 
@@ -125,9 +146,6 @@ func (f *FS) FailOpen(p string, err error) *FS {
 	return f
 }
 
-// VanishOnOpen: the file shows up in its directory listing but is gone by the time it's opened.
-func (f *FS) VanishOnOpen(p string) *FS { return f.FailOpen(p, NotExist(p)) }
-
 // WithLatency makes every call take d (of virtual time, inside a synctest bubble).
 func (f *FS) WithLatency(d time.Duration) *FS {
 	f.mu.Lock()
@@ -136,10 +154,23 @@ func (f *FS) WithLatency(d time.Duration) *FS {
 	return f
 }
 
-func (f *FS) Calls() (list, open int) {
+// ListCalls returns the number of ListPage calls, in total or (with a dir) for one directory.
+func (f *FS) ListCalls(dir ...string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.listCalls, f.openCalls
+	n := 0
+	for d, c := range f.listCalls {
+		if len(dir) == 0 || d == dir[0] {
+			n += c
+		}
+	}
+	return n
+}
+
+func (f *FS) OpenCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.openCalls
 }
 
 func (f *FS) PeakInFlight() int {
@@ -148,53 +179,75 @@ func (f *FS) PeakInFlight() int {
 	return f.peakInFlight
 }
 
-func (f *FS) ListFiles(_ context.Context, p string) ([]string, error) {
-	return track(f, &f.listCalls, f.listErrs, p, func() ([]string, error) {
-		dir := f.lookup(split(f.canonical(p, 0)))
+func (f *FS) ListPage(_ context.Context, dir, token string) (domain.Page, error) {
+	f.mu.Lock()
+	f.listCalls[dir]++
+	f.mu.Unlock()
+	return track(f, func() (domain.Page, error) {
+		if fault, ok := f.listErrs[dir]; ok && fault.times != 0 {
+			if fault.times > 0 {
+				fault.times--
+				f.listErrs[dir] = fault
+			}
+			return domain.Page{}, fault.err
+		}
+		d := f.lookup(dir, false)
 		switch {
-		case dir == nil:
-			return nil, NotExist(p)
-		case dir.kind != kindDir:
-			return nil, fmt.Errorf("%s: not a directory", p)
+		case d == nil:
+			return domain.Page{}, NotExist(dir)
+		case d.kind != kindDir:
+			return domain.Page{}, fmt.Errorf("%s: not a directory", dir)
 		}
-		out := make([]string, 0, len(dir.children))
-		for name := range dir.children { // map order: deliberately random, the walker must sort
-			out = append(out, path.Join(p, name))
+		names := make([]string, 0, len(d.children))
+		for name := range d.children {
+			names = append(names, name)
 		}
-		return out, nil
+		slices.Sort(names)
+		start := sort.SearchStrings(names, token)
+		if start < len(names) && names[start] == token {
+			start++
+		}
+		end := min(start+f.pageSize, len(names))
+		page := domain.Page{}
+		for _, name := range names[start:end] {
+			page.Entries = append(page.Entries, info(path.Join(dir, name), d.children[name]))
+		}
+		if end < len(names) {
+			page.NextToken = names[end-1]
+		}
+		return page, nil
 	})
 }
 
 func (f *FS) OpenFile(_ context.Context, p string) (domain.FileInfo, error) {
-	return track(f, &f.openCalls, f.openErrs, p, func() (domain.FileInfo, error) {
-		own := f.lookupNoFollow(p)
-		if own == nil {
+	f.mu.Lock()
+	f.openCalls++
+	f.mu.Unlock()
+	return track(f, func() (domain.FileInfo, error) {
+		if err := f.openErrs[p]; err != nil {
+			return domain.FileInfo{}, err
+		}
+		n := f.lookup(p, false)
+		if n == nil {
 			return domain.FileInfo{}, NotExist(p)
 		}
-		canonical := f.canonical(p, 0)
-		target := f.lookup(split(canonical))
-		if target == nil {
-			return domain.FileInfo{}, NotExist(p) // dangling symlink
-		}
-		info := domain.FileInfo{Path: p, Name: path.Base(p), IsSymlink: own.kind == kindSymlink, CanonicalPath: p}
-		if info.IsSymlink {
-			info.CanonicalPath = canonical
-		}
-		if target.kind == kindDir {
-			info.IsDir, info.Permissions = true, 0o755
-			return info, nil
-		}
-		info.Size, info.ModTime, info.Permissions, info.ETag = target.size, target.modTime, target.perm, target.etag
-		return info, nil
+		return info(p, n), nil
 	})
 }
 
-func track[T any](f *FS, counter *int, errs map[string]error, p string, op func() (T, error)) (T, error) {
+func info(p string, n *node) domain.FileInfo {
+	return domain.FileInfo{
+		Path: p, Name: path.Base(p), Permissions: n.perm, Size: n.size, ModTime: n.modTime, ETag: n.etag,
+		IsDir: n.kind == kindDir, IsSymlink: n.kind == kindSymlink,
+	}
+}
+
+// track runs op under the lock after the configured latency, recording peak concurrency.
+func track[T any](f *FS, op func() (T, error)) (T, error) {
 	f.mu.Lock()
-	*counter++
 	f.inFlight++
 	f.peakInFlight = max(f.peakInFlight, f.inFlight)
-	latency, injected := f.latency, errs[p]
+	latency := f.latency
 	f.mu.Unlock()
 
 	if latency > 0 {
@@ -204,52 +257,18 @@ func track[T any](f *FS, counter *int, errs map[string]error, p string, op func(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.inFlight--
-	if injected != nil {
-		var zero T
-		return zero, injected
-	}
 	return op()
 }
 
-// lookupNoFollow finds the node at p without following a symlink in the last segment.
-func (f *FS) lookupNoFollow(p string) *node {
+// lookup finds the node at p (or its parent, if parent is true). The caller holds f.mu.
+func (f *FS) lookup(p string, parent bool) *node {
 	parts := split(p)
-	if len(parts) == 0 {
-		return f.root
-	}
-	parent := f.lookup(split(f.canonical("/"+strings.Join(parts[:len(parts)-1], "/"), 0)))
-	if parent == nil || parent.kind != kindDir {
-		return nil
-	}
-	return parent.children[parts[len(parts)-1]]
-}
-
-// canonical resolves symlinks in every segment in one pass (O(depth) unless it crosses symlinks).
-// Recursion is bounded, so cyclic links end the way ELOOP would on a real system.
-func (f *FS) canonical(p string, depth int) string {
-	if depth > 40 {
-		return p
-	}
-	var out []string
-	cur := f.root
-	for _, part := range split(p) {
-		var child *node
-		if cur != nil && cur.kind == kindDir {
-			child = cur.children[part]
+	if parent {
+		if len(parts) == 0 {
+			return nil
 		}
-		if child != nil && child.kind == kindSymlink {
-			out = split(f.canonical(child.target, depth+1))
-			cur = f.lookup(out)
-			continue
-		}
-		out = append(out, part)
-		cur = child
+		parts = parts[:len(parts)-1]
 	}
-	return "/" + strings.Join(out, "/")
-}
-
-// lookup walks parts literally (no symlink resolution).
-func (f *FS) lookup(parts []string) *node {
 	cur := f.root
 	for _, part := range parts {
 		if cur.kind != kindDir {

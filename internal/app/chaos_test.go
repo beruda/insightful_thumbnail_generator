@@ -56,7 +56,9 @@ func chaos(t *testing.T, seed uint64) {
 		c.Runner.MaxAttempts = 4
 		c.Runner.ProcessTimeout = 5 * time.Second
 		c.Runner.MaxInputBytes = chaosMaxInput
+		c.Scanner.MaxAttempts = 5
 	}))
+	h.FS.WithPageSize(7) // many pages per directory
 
 	var videos []string
 	for i := range chaosFiles {
@@ -88,6 +90,19 @@ func chaos(t *testing.T, seed uint64) {
 			h.Launcher.Script(path, transient()) // never recovers: exhausts its attempts
 		default:
 			h.Launcher.Script(path, tk.ExitWith(1, tk.CorruptStderr)) // permanent
+		}
+	}
+	// Transient listing failures on ~20% of directories, always fewer than the scanner's MaxAttempts.
+	for d := range 20 {
+		for _, dir := range append([]string{fmt.Sprintf("/videos/d%d", d)}, func() (sub []string) {
+			for e := range 5 {
+				sub = append(sub, fmt.Sprintf("/videos/d%d/e%d", d, e))
+			}
+			return sub
+		}()...) {
+			if random() < 0.2 {
+				h.FS.FailListTimes(dir, 1+pick(3), nil)
+			}
 		}
 	}
 	h.Blobs.FailRandomly("Put", 0.05, random)

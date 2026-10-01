@@ -25,10 +25,11 @@ func DefaultConfig() app.Config {
 		Once:         true,
 		ScanInterval: time.Minute,
 		Scanner: scanner.Config{
-			Root:            Root,
-			Extensions:      scanner.DefaultVideoExtensions,
-			WalkConcurrency: 4,
-			CheckpointEvery: 1,
+			Root:        Root,
+			Extensions:  scanner.DefaultVideoExtensions,
+			Concurrency: 4,
+			MaxAttempts: 3,
+			RetryDelay:  100 * time.Millisecond,
 		},
 		Worker: worker.Config{Concurrency: 4, ShutdownGrace: 5 * time.Second},
 		Runner: worker.RunnerConfig{
@@ -46,18 +47,18 @@ func DefaultConfig() app.Config {
 // Scanner, ...); integration tests run the whole Service exactly as main wires it.
 // Create it inside a synctest bubble when the test depends on time.
 type Harness struct {
-	FS          *FS
-	Scratch     *Scratch
-	Launcher    *Launcher
-	Blobs       *Blobs
-	Repo        *Repo
-	Events      *Events
-	Checkpoints *Checkpoints
-	Queue       *queue.Memory[domain.VideoJob]
-	Metrics     *metrics.Counters
-	Logs        *LogRecorder
-	Random      func() float64
-	Config      app.Config
+	FS       *FS
+	Scratch  *Scratch
+	Launcher *Launcher
+	Blobs    *Blobs
+	Repo     *Repo
+	Events   *Events
+	Queue    *queue.Memory[domain.VideoJob] // video jobs
+	Dirs     *queue.Memory[scanner.DirJob]  // directory pages to list
+	Metrics  *metrics.Counters
+	Logs     *LogRecorder
+	Random   func() float64
+	Config   app.Config
 }
 
 type Option func(*harnessOptions)
@@ -85,41 +86,41 @@ func NewHarness(opts ...Option) *Harness {
 	}
 	scratch := NewScratch()
 	return &Harness{
-		FS:          NewFS().Dir(Root),
-		Scratch:     scratch,
-		Launcher:    NewLauncher(scratch),
-		Blobs:       &Blobs{MemoryBlobStore: storage.NewMemoryBlobStore()},
-		Repo:        &Repo{MemoryRepository: storage.NewMemoryRepository()},
-		Events:      &Events{},
-		Checkpoints: &Checkpoints{},
-		Queue:       queue.NewMemory[domain.VideoJob](o.queueCapacity),
-		Metrics:     metrics.New(),
-		Logs:        &LogRecorder{},
-		Random:      Seeded(o.seed),
-		Config:      cfg,
+		FS:       NewFS().Dir(Root),
+		Scratch:  scratch,
+		Launcher: NewLauncher(scratch),
+		Blobs:    &Blobs{MemoryBlobStore: storage.NewMemoryBlobStore()},
+		Repo:     &Repo{MemoryRepository: storage.NewMemoryRepository()},
+		Events:   &Events{},
+		Queue:    queue.NewMemory[domain.VideoJob](o.queueCapacity),
+		Dirs:     queue.NewUnbounded[scanner.DirJob](),
+		Metrics:  metrics.New(),
+		Logs:     &LogRecorder{},
+		Random:   Seeded(o.seed),
+		Config:   cfg,
 	}
 }
 
 func (h *Harness) Deps() app.Deps {
-	return h.depsWith(h.Queue)
+	return h.depsWith(h.Queue, h.Dirs)
 }
 
-func (h *Harness) depsWith(q queue.Queue[domain.VideoJob]) app.Deps {
+func (h *Harness) depsWith(q queue.Queue[domain.VideoJob], dirs queue.Queue[scanner.DirJob]) app.Deps {
 	return app.Deps{
-		FS: h.FS, Queue: q, Launch: h.Launcher.Launch, Scratch: h.Scratch, Blobs: h.Blobs,
-		Repository: h.Repo, Events: h.Events, Checkpoints: h.Checkpoints, Random: h.Random,
+		FS: h.FS, Videos: q, Dirs: dirs, Launch: h.Launcher.Launch, Scratch: h.Scratch, Blobs: h.Blobs,
+		Repository: h.Repo, Events: h.Events, Random: h.Random,
 		Logger: slog.New(h.Logs), Metrics: h.Metrics,
 	}
 }
 
 func (h *Harness) Service() *app.Service { return app.NewService(h.Deps(), h.Config) }
 
-func (h *Harness) Scanner() *scanner.Scanner { return h.scannerWith(h.Queue) }
+func (h *Harness) Scanner() *scanner.Scanner { return h.scannerWith(h.Queue, h.Dirs) }
 
-func (h *Harness) scannerWith(q queue.Queue[domain.VideoJob]) *scanner.Scanner {
-	d := h.depsWith(q)
-	return scanner.New(scanner.Deps{FS: d.FS, Queue: d.Queue, Repository: d.Repository,
-		Checkpoints: d.Checkpoints, Logger: d.Logger, Metrics: d.Metrics}, h.Config.Scanner)
+func (h *Harness) scannerWith(q queue.Queue[domain.VideoJob], dirs queue.Queue[scanner.DirJob]) *scanner.Scanner {
+	d := h.depsWith(q, dirs)
+	return scanner.New(scanner.Deps{FS: d.FS, Dirs: d.Dirs, Videos: d.Videos, Repository: d.Repository,
+		Logger: d.Logger, Metrics: d.Metrics}, h.Config.Scanner)
 }
 
 func (h *Harness) Runner() *worker.Runner {
@@ -129,7 +130,7 @@ func (h *Harness) Runner() *worker.Runner {
 }
 
 // Restarted simulates a process restart: the in-memory queue is gone, but persistent state
-// (file system, repository, blobs, checkpoints) survives.
+// (file system, repository, blobs) survives.
 type Restarted struct {
 	Queue   *queue.Memory[domain.VideoJob]
 	Service *app.Service
@@ -137,8 +138,8 @@ type Restarted struct {
 }
 
 func (h *Harness) Restart() Restarted {
-	q := queue.NewMemory[domain.VideoJob](1000)
-	return Restarted{Queue: q, Service: app.NewService(h.depsWith(q), h.Config), Scanner: h.scannerWith(q)}
+	q, dirs := queue.NewMemory[domain.VideoJob](1000), queue.NewUnbounded[scanner.DirJob]()
+	return Restarted{Queue: q, Service: app.NewService(h.depsWith(q, dirs), h.Config), Scanner: h.scannerWith(q, dirs)}
 }
 
 // PendingPaths returns the paths of jobs waiting in q.

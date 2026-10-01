@@ -2,7 +2,6 @@ package app_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"testing/synctest"
@@ -231,8 +230,10 @@ func TestServiceRoles(t *testing.T) {
 func TestServiceFatalScannerErrorStopsWorkers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := withVideos(tk.NewHarness(tk.Configure(func(c *app.Config) { c.Once = false })), 3)
-		h.Checkpoints.FailAlways("Clear")
+		h.Config.Scanner.Concurrency = 0 // invalid: the scanner fails at startup
 		err := h.Service().Run(context.Background())
-		tk.True(t, err != nil && errors.Unwrap(err) != nil, "want a wrapped scanner error, got %v", err)
+		// Without the shared cancel, the long-running worker would wait forever and synctest would
+		// report a deadlock instead of returning.
+		tk.True(t, err != nil, "want the scanner error, got nil")
 	})
 }

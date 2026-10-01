@@ -26,15 +26,14 @@ type Options struct {
 }
 
 type DataPaths struct {
-	Blobs, Database, Checkpoint, Scratch string
+	Blobs, Database, Scratch string
 }
 
 func (o Options) Paths() DataPaths {
 	return DataPaths{
-		Blobs:      filepath.Join(o.DataDir, "blobs"),
-		Database:   filepath.Join(o.DataDir, "thumbnails.sqlite"),
-		Checkpoint: filepath.Join(o.DataDir, "scan-checkpoint.json"),
-		Scratch:    filepath.Join(o.DataDir, "scratch"),
+		Blobs:    filepath.Join(o.DataDir, "blobs"),
+		Database: filepath.Join(o.DataDir, "thumbnails.sqlite"),
+		Scratch:  filepath.Join(o.DataDir, "scratch"),
 	}
 }
 
@@ -43,19 +42,19 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 	fs := flag.NewFlagSet("thumbnailer", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		root           = fs.String("root", "", "directory to scan (required unless -role=worker)")
-		role           = fs.String("role", "all", "all | scanner | worker")
-		once           = fs.Bool("once", false, "scan once, drain the queue, print a summary and exit")
-		dataDir        = fs.String("data-dir", "./data", "thumbnails, metadata DB, checkpoint and scratch files")
-		concurrency    = fs.Int("concurrency", runtime.NumCPU(), "parallel ffmpeg processes")
-		timeout        = fs.Duration("timeout", 2*time.Minute, "per-process time limit")
-		maxAttempts    = fs.Int("max-attempts", 4, "attempts before dead-lettering")
-		maxInputMB     = fs.Int64("max-input-mb", 20*1024, "skip larger videos")
-		scanInterval   = fs.Duration("scan-interval", 5*time.Minute, "delay between scans without -once")
-		followSymlinks = fs.Bool("follow-symlinks", false, "follow symlinks (loops are detected)")
-		healthAddr     = fs.String("health-addr", "", "serve GET /healthz on this address, e.g. :8080")
-		ffmpegPath     = fs.String("ffmpeg", "ffmpeg", "ffmpeg binary")
-		logLevel       = fs.String("log-level", "info", "debug | info | warn | error")
+		root         = fs.String("root", "", "directory to scan (required unless -role=worker)")
+		role         = fs.String("role", "all", "all | scanner | worker")
+		once         = fs.Bool("once", false, "scan once, drain the queue, print a summary and exit")
+		dataDir      = fs.String("data-dir", "./data", "thumbnails, metadata DB and scratch files")
+		concurrency  = fs.Int("concurrency", runtime.NumCPU(), "parallel ffmpeg processes")
+		timeout      = fs.Duration("timeout", 2*time.Minute, "per-process time limit")
+		maxAttempts  = fs.Int("max-attempts", 4, "attempts before dead-lettering")
+		maxInputMB   = fs.Int64("max-input-mb", 20*1024, "skip larger videos")
+		scanInterval = fs.Duration("scan-interval", 5*time.Minute, "delay between scans without -once")
+		scanConc     = fs.Int("scan-concurrency", 16, "directory pages listed in parallel")
+		healthAddr   = fs.String("health-addr", "", "serve GET /healthz on this address, e.g. :8080")
+		ffmpegPath   = fs.String("ffmpeg", "ffmpeg", "ffmpeg binary")
+		logLevel     = fs.String("log-level", "info", "debug | info | warn | error")
 	)
 	if err := fs.Parse(args); err != nil {
 		return Options{}, err
@@ -67,8 +66,8 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 		return Options{}, fmt.Errorf("-role must be all, scanner or worker, got %q", *role)
 	case r != RoleWorker && *root == "":
 		return Options{}, errors.New("-root is required")
-	case *concurrency < 1, *maxAttempts < 1, *maxInputMB < 1, *timeout <= 0, *scanInterval <= 0:
-		return Options{}, errors.New("-concurrency, -max-attempts, -max-input-mb, -timeout and -scan-interval must be positive")
+	case *concurrency < 1, *scanConc < 1, *maxAttempts < 1, *maxInputMB < 1, *timeout <= 0, *scanInterval <= 0:
+		return Options{}, errors.New("-concurrency, -scan-concurrency, -max-attempts, -max-input-mb, -timeout and -scan-interval must be positive")
 	}
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
@@ -89,11 +88,11 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 			Once:         *once,
 			ScanInterval: *scanInterval,
 			Scanner: scanner.Config{
-				Root:            absRoot,
-				Extensions:      scanner.DefaultVideoExtensions,
-				WalkConcurrency: 16,
-				FollowSymlinks:  *followSymlinks,
-				CheckpointEvery: 100,
+				Root:        absRoot,
+				Extensions:  scanner.DefaultVideoExtensions,
+				Concurrency: *scanConc,
+				MaxAttempts: 5,
+				RetryDelay:  time.Second,
 			},
 			Worker: worker.Config{Concurrency: *concurrency, ShutdownGrace: 10 * time.Second},
 			Runner: worker.RunnerConfig{

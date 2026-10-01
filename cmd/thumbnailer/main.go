@@ -18,6 +18,7 @@ import (
 	"github.com/vukkremic/thumbnailer/internal/domain"
 	"github.com/vukkremic/thumbnailer/internal/metrics"
 	"github.com/vukkremic/thumbnailer/internal/queue"
+	"github.com/vukkremic/thumbnailer/internal/scanner"
 )
 
 func main() {
@@ -62,17 +63,17 @@ func serve(opts app.Options, logger *slog.Logger) error {
 	counters := metrics.New()
 	jobs := queue.NewMemory[domain.VideoJob](opts.QueueCapacity)
 	service := app.NewService(app.Deps{
-		FS:          adapters.OSFileSystem{},
-		Queue:       jobs,
-		Launch:      adapters.FFmpegLauncher(opts.FFmpegPath, opts.ThumbWidth),
-		Scratch:     adapters.ScratchDir{Dir: paths.Scratch},
-		Blobs:       adapters.LocalBlobStore{Root: paths.Blobs},
-		Repository:  repo,
-		Events:      app.LogEvents{Logger: logger},
-		Checkpoints: adapters.FileCheckpoints{Path: paths.Checkpoint},
-		Random:      rand.Float64,
-		Logger:      logger,
-		Metrics:     counters,
+		FS:         adapters.OSFileSystem{},
+		Videos:     jobs,
+		Dirs:       queue.NewUnbounded[scanner.DirJob](),
+		Launch:     adapters.FFmpegLauncher(opts.FFmpegPath, opts.ThumbWidth),
+		Scratch:    adapters.ScratchDir{Dir: paths.Scratch},
+		Blobs:      adapters.LocalBlobStore{Root: paths.Blobs},
+		Repository: repo,
+		Events:     app.LogEvents{Logger: logger},
+		Random:     rand.Float64,
+		Logger:     logger,
+		Metrics:    counters,
 	}, opts.Service)
 
 	if opts.HealthAddr != "" {
