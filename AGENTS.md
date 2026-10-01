@@ -89,7 +89,9 @@ Each one has tests; if a change makes one fail, the change is wrong, not the tes
 - Keep error kinds in `worker/failures.go`. A new permanent ffmpeg error is a new pattern there plus a row in
   `TestClassifyProcessFailure`, and ideally a real-ffmpeg sample in the smoke tests.
 - Config flags go through `app.ParseFlags`, with validation and a test in `config_test.go`.
-- Update `README.md` when behavior, numbers or known limits change.
+- Update `README.md` when behavior, numbers or known limits change. The README is formatted by the editor's Markdown
+  formatter on save: tables padded to aligned columns, list continuation lines not indented, blank lines around
+  blocks. Follow that style in edits so the next save doesn't produce a whitespace-only diff.
 
 ## Git
 
